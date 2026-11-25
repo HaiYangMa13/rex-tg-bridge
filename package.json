@@ -1,0 +1,52 @@
+{
+  "name": "rex-tg-bridge",
+  "version": "0.1.0",
+  "description": "24/7 Telegram Forum Topics bridge for Rex Server and terminal coding agents (agy, Claude Code, Codex, pi, and generic shells)",
+  "type": "module",
+  "license": "MIT",
+  "author": "HaiYangMa13",
+  "homepage": "https://github.com/HaiYangMa13/rex-tg-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaiYangMa13/rex-tg-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HaiYangMa13/rex-tg-bridge/issues"
+  },
+  "keywords": [
+    "rex",
+    "telegram",
+    "telegram-bot",
+    "forum-topics",
+    "coding-agent",
+    "antigravity",
+    "claude-code",
+    "codex",
+    "terminal",
+    "multiplexer"
+  ],
+  "bin": {
+    "rex-tg-bridge": "./bin/rex-tg-bridge.js",
+    "rex-tg-notify": "./bin/rex-tg-notify.js"
+  },
+  "files": [
+    "bin",
+    "python",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "python3 -B -m unittest discover -s tests -p 'test_*.py' -v && node --test tests/*.test.mjs",
+    "verify": "npm test && npm pack --dry-run",
+    "prepublishOnly": "npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
