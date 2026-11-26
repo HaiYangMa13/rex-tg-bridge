@@ -1,6 +1,6 @@
 {
   "name": "rex-tg-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "24/7 Telegram Forum Topics bridge for Rex Server and terminal coding agents (agy, Claude Code, Codex, pi, and generic shells)",
   "type": "module",
   "license": "MIT",
@@ -26,8 +26,8 @@
     "multiplexer"
   ],
   "bin": {
-    "rex-tg-bridge": "./bin/rex-tg-bridge.js",
-    "rex-tg-notify": "./bin/rex-tg-notify.js"
+    "rex-tg-bridge": "bin/rex-tg-bridge.js",
+    "rex-tg-notify": "bin/rex-tg-notify.js"
   },
   "files": [
     "bin",
