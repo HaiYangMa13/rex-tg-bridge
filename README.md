@@ -21,6 +21,10 @@ Run it directly on your Linux server alongside `rex.service` (`systemd --user` +
     - **Codex CLI**: `notify` (`agent-turn-complete`).
     - **Any script / agent (`pi`, `opencode`, etc.)**: `rex-tg-notify "message"`.
   - **Rex Native Event Fallback (`rex events --all --json`)**: listens to OSC 7501 `program_status_changed` (`done` / `blocked` / `error`), `desktop_notification`, `bell`, and `child_exited` with automatic TUI chrome scrubbing and hook-race deduplication.
+- **Presence-Aware Anti-Spam (`smart` / `away` / `always`)**
+  - Detects when a Rex GUI client (`kind == "app"`, macOS / iOS) is connected via `client.list`.
+  - In `smart` mode (default): suppresses normal pushes while you are actively working in Rex App, while still delivering replies to Topics you recently messaged from Telegram — and keeps urgent `blocked` / `question` / `error` prompts enabled.
+  - Per-topic `/mute`, `/watch`, and `/unmute` overrides.
 - **Zero External Dependencies**: Pure Node.js CLI + Python 3 stdlib daemon. Supports HTTP/HTTPS proxies (`TG_PROXY`) and custom Telegram Bot API reverse proxies (`TG_API_BASE`, e.g. Cloudflare Workers).
 
 ## Architecture
@@ -86,10 +90,12 @@ The bridge locks authorization exclusively to your Telegram user ID and automati
 | --- | --- | --- |
 | `/bind` | Supergroup | Bind group & owner on first setup |
 | `/unbind` | Bound group | Reset binding |
+| `/mode [smart\|away\|always]` | Bound group | View or switch presence-aware notification mode |
 | `/sync` | Bound group | Sync live Rex sessions to Topics and remove stale ones |
 | `/sessions`, `/ls` | Bound group | List live Rex sessions and foreground programs |
 | `/new <name> [cmd]` | Bound group | Create a new Rex session (e.g. `/new fix-api agy`) |
 | *(plain text)* | Session Topic | Paste & press Enter into target pane (Reply routes to exact block) |
+| `/mute`, `/watch`, `/unmute` | Session Topic | Mute, force-watch, or reset notification override for this Topic |
 | `/screen [N]`, `/s` | Session Topic | Capture terminal content with TUI noise scrubbed |
 | `/rawscreen [N]` | Session Topic | Raw uncleaned terminal capture |
 | `/panes` | Session Topic | List and switch active pane in the session |

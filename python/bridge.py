@@ -43,6 +43,12 @@ CAPTURE_LINES = int(os.environ.get("CAPTURE_LINES", "45"))
 HOOK_DEDUP_SEC = float(os.environ.get("HOOK_DEDUP_SEC", "12"))
 HOOK_GRACE_SEC = float(os.environ.get("HOOK_GRACE_SEC", "1.3"))
 BELL_COOLDOWN_SEC = float(os.environ.get("BELL_COOLDOWN_SEC", "15"))
+NOTIFY_MODE = os.environ.get("NOTIFY_MODE", "smart").strip().lower()
+if NOTIFY_MODE not in ("smart", "away", "always"):
+    NOTIFY_MODE = "smart"
+TG_ACTIVE_WINDOW_SEC = float(os.environ.get("TG_ACTIVE_WINDOW_SEC", "900"))
+ALWAYS_PUSH_URGENT = os.environ.get("ALWAYS_PUSH_URGENT", "1").strip().lower() not in ("0", "false", "no", "off")
+CLIENT_CACHE_TTL_SEC = float(os.environ.get("CLIENT_CACHE_TTL_SEC", "3.0"))
 
 MAX_MSG_ROUTES = 2500
 MAX_TG_CHUNK = 3600
@@ -271,6 +277,7 @@ class StateStore:
         self.last_hook_ts: dict[str, float] = {}
         self.last_bell_ts: dict[str, float] = {}
         self.last_sent_text: dict[str, str] = {}
+        self.last_tg_input_ts: dict[str, float] = {}
         self.load()
 
     def load(self) -> None:
@@ -539,6 +546,28 @@ class RexClient:
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or "kill failed")
 
+    def list_connected_app_clients(self) -> list[dict[str, Any]]:
+        now = time.time()
+        cache = getattr(self, "_app_clients_cache", None)
+        if cache is not None and now - cache[0] < CLIENT_CACHE_TTL_SEC:
+            return cache[1]
+        try:
+            res = self._run_json(["api", "call", "client.list", '{"kinds":["app"]}'], timeout=6)
+            clients = res.get("clients") or []
+            connected = [
+                c for c in clients
+                if ((c.get("info") or {}).get("kind") == "app")
+                and ((c.get("connection_state") or "connected") == "connected")
+            ]
+            self._app_clients_cache = (now, connected)
+            return connected
+        except Exception as exc:
+            log.debug("client.list failed: %s", exc)
+            return []
+
+    def invalidate_client_cache(self) -> None:
+        self._app_clients_cache = None
+
 
 class Bridge:
     def __init__(self, tg: TelegramAPI, rex: RexClient, store: StateStore) -> None:
@@ -737,6 +766,120 @@ class Bridge:
             ]
         }
 
+    # ---- Notification Policy (smart / away / always + per-topic mute/watch) ----
+
+    def get_notify_mode(self) -> str:
+        with self.store.lock:
+            mode = self.store.data.get("notify_mode")
+            if mode in ("smart", "away", "always"):
+                return mode
+        return NOTIFY_MODE
+
+    def get_always_push_urgent(self) -> bool:
+        with self.store.lock:
+            val = self.store.data.get("always_push_urgent")
+            if isinstance(val, bool):
+                return val
+        return ALWAYS_PUSH_URGENT
+
+    def mark_tg_activity(self, session_id: str) -> None:
+        with self.store.lock:
+            self.store.last_tg_input_ts[session_id] = time.time()
+
+    def should_push_outbound(self, session_id: str, status: str = "done") -> tuple[bool, str]:
+        with self.store.lock:
+            entry = self.store.data.get("sessions", {}).get(session_id) or {}
+            override = entry.get("notify_override")
+            last_tg_ts = self.store.last_tg_input_ts.get(session_id, 0.0)
+
+        if override == "mute":
+            return False, "topic_muted"
+        if override == "watch":
+            return True, "topic_watched"
+
+        mode = self.get_notify_mode()
+        if mode == "always":
+            return True, "mode_always"
+
+        if self.get_always_push_urgent() and status in ("blocked", "question", "error"):
+            return True, "urgent"
+
+        app_clients = self.rex.list_connected_app_clients()
+        if not app_clients:
+            return True, "app_away"
+
+        if mode == "away":
+            return False, "app_connected_away"
+
+        # mode == "smart": push only if this topic was recently interacted with from Telegram
+        if time.time() - last_tg_ts <= TG_ACTIVE_WINDOW_SEC:
+            return True, "tg_active"
+        return False, "app_connected_idle_in_tg"
+
+    def _snapshot_block_async(self, session_id: str, block_id: str | None) -> None:
+        if not block_id:
+            return
+
+        def _snap() -> None:
+            try:
+                self.store.last_captures[block_id] = self.rex.capture(session_id, block_id)
+            except Exception:
+                pass
+
+        threading.Thread(target=_snap, daemon=True).start()
+
+    def _mode_status_html_and_kb(self, sid: str | None = None) -> tuple[str, dict[str, Any]]:
+        mode = self.get_notify_mode()
+        urgent = self.get_always_push_urgent()
+        apps = self.rex.list_connected_app_clients()
+        if apps:
+            names = ", ".join(
+                (c.get("info") or {}).get("label")
+                or (c.get("info") or {}).get("platform")
+                or "app"
+                for c in apps
+            )
+            app_line = f"🟢 在线 ({html.escape(names)})"
+        else:
+            app_line = "⚪ 离线（将自动推送全部话题）"
+
+        mode_desc = {
+            "smart": "🧠 <b>smart</b>（Rex App 在线时，仅推近期在 TG 发过消息的话题）",
+            "away": "🌙 <b>away</b>（Rex App 在线时全部静音，断开后恢复）",
+            "always": "📢 <b>always</b>（始终全部推送）",
+        }[mode]
+
+        lines = [
+            "<b>通知推送策略</b>",
+            f"• 当前模式：{mode_desc}",
+            f"• 紧急提醒（审批/提问/报错）：<b>{'开启' if urgent else '关闭'}</b>",
+            f"• Rex GUI 客户端：{app_line}",
+        ]
+        if sid:
+            with self.store.lock:
+                ov = (self.store.data.get("sessions", {}).get(sid) or {}).get("notify_override")
+            ov_label = {"mute": "🔇 已静音 (/unmute 恢复)", "watch": "👁 强制关注 (/unmute 恢复)"}.get(
+                ov, "跟随全局模式（可用 /mute 或 /watch 单独覆盖）"
+            )
+            lines.append(f"• 当前话题：{ov_label}")
+
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": f"{'✅ ' if mode == 'smart' else ''}🧠 smart", "callback_data": "mode:smart"},
+                    {"text": f"{'✅ ' if mode == 'away' else ''}🌙 away", "callback_data": "mode:away"},
+                    {"text": f"{'✅ ' if mode == 'always' else ''}📢 always", "callback_data": "mode:always"},
+                ],
+                [
+                    {
+                        "text": f"🔔 紧急提醒：{'开' if urgent else '关'}（点击切换）",
+                        "callback_data": "mode:urgent",
+                    }
+                ],
+            ]
+        }
+        return "\n".join(lines), kb
+
     # ---- Outbound: Agent / Rex -> Telegram ----
 
     def push_to_topic(
@@ -843,6 +986,12 @@ class Bridge:
             with self.store.lock:
                 self.store.last_hook_ts[block_id] = time.time()
 
+        allowed, reason = self.should_push_outbound(session_id, status=status)
+        if not allowed:
+            log.info("Suppressed hook push for %s (%s): %s", session_id[-8:], status, reason)
+            self._snapshot_block_async(session_id, block_id)
+            return {"ok": True, "suppressed": reason}
+
         icon = {
             "done": "🤖",
             "blocked": "⏳",
@@ -875,6 +1024,12 @@ class Bridge:
                 return
 
         if time.time() - self.store.last_hook_ts.get(bid, 0.0) < HOOK_DEDUP_SEC:
+            return
+
+        allowed, reason = self.should_push_outbound(sid, status=state or "done")
+        if not allowed:
+            log.info("Suppressed program_status(%s) for %s: %s", state, sid[-8:], reason)
+            self._snapshot_block_async(sid, bid)
             return
 
         curr = ""
@@ -916,6 +1071,10 @@ class Bridge:
         ev_type = raw.get("type")
         payload = raw.get("payload") or {}
 
+        if ev_type in ("client_joined", "client_left", "client_changed"):
+            self.rex.invalidate_client_cache()
+            return
+
         if ev_type == "session_created":
             sess = payload.get("session") or {}
             sid = sess.get("session_id")
@@ -936,6 +1095,10 @@ class Bridge:
         inner = payload.get("event") or {}
         inner_type = inner.get("type")
         inner_payload = inner.get("payload") or {}
+
+        if inner_type in ("client_connected", "client_disconnected", "client_connection_changed"):
+            self.rex.invalidate_client_cache()
+            return
 
         if inner_type == "session_label_changed" and sid:
             new_label = inner_payload.get("label")
@@ -967,6 +1130,10 @@ class Bridge:
                 ).start()
 
         elif ev_name == "desktop_notification":
+            allowed, reason = self.should_push_outbound(sid, status="info")
+            if not allowed:
+                log.debug("Suppressed desktop_notification for %s: %s", sid[-8:], reason)
+                return
             title = ev_data.get("title") or "通知"
             body = ev_data.get("body") or ""
             header = f"🔔 <b>{html.escape(title)}</b>"
@@ -977,6 +1144,11 @@ class Bridge:
             if now - self.store.last_bell_ts.get(bid, 0.0) < BELL_COOLDOWN_SEC:
                 return
             self.store.last_bell_ts[bid] = now
+            allowed, reason = self.should_push_outbound(sid, status="info")
+            if not allowed:
+                log.debug("Suppressed bell for %s: %s", sid[-8:], reason)
+                self._snapshot_block_async(sid, bid)
+                return
             try:
                 curr = self.rex.capture(sid, bid)
                 raw_diff = compute_capture_diff(self.store.last_captures.get(bid), curr, fallback_tail=25)
@@ -990,6 +1162,11 @@ class Bridge:
 
         elif ev_name == "child_exited":
             code = ev_data.get("exit_code")
+            status = "error" if code not in (0, None) else "info"
+            allowed, reason = self.should_push_outbound(sid, status=status)
+            if not allowed:
+                log.debug("Suppressed child_exited for %s: %s", sid[-8:], reason)
+                return
             err = ev_data.get("error") or ""
             header = f"⏹ <b>终端进程退出</b> (code={code})"
             self.push_to_topic(sid, bid, header, err or f"exit_code={code}", kb_kind="none", render_md=False)
@@ -1167,12 +1344,14 @@ class Bridge:
             help_text = (
                 "<b>Rex ↔ Telegram Topics 桥接命令</b>\n\n"
                 "<b>全局命令（General 或任意话题）</b>\n"
+                "• /mode <code>[smart|away|always]</code> — 查看/切换推送防打扰模式\n"
                 "• /sync — 同步全部 Rex Sessions 为 Topics\n"
                 "• /sessions 或 /ls — 查看全部在线 Session 与进程\n"
                 "• /new <code>&lt;name&gt; [cmd]</code> — 新建 Session（例: <code>/new fix-api agy</code>）\n"
                 "• /unbind — 解除当前群绑定\n\n"
                 "<b>Session 话题内命令</b>\n"
                 "• <i>直接发文字</i> — 粘贴并回车发送给当前 Agent（Reply 某条推送可精准回到原 pane）\n"
+                "• /mute · /watch · /unmute — 静音 / 强制关注 / 恢复跟随全局模式\n"
                 "• /screen <code>[行数]</code> 或 /s — 抓屏（默认 45 行，自动清洗 TUI 装饰线）\n"
                 "• /rawscreen <code>[行数]</code> — 原始未清洗终端截屏\n"
                 "• /panes — 查看并切换该 Session 下的分屏/Tab\n"
@@ -1182,6 +1361,19 @@ class Bridge:
                 "• /kill — 关闭当前 Rex Session（带确认）"
             )
             self.tg.send_html(chat_id, help_text, thread_id=thread_id)
+            return
+
+        if cmd == "/mode":
+            if arg.lower() in ("smart", "away", "always"):
+                new_mode = arg.lower()
+                with self.store.lock:
+                    self.store.data["notify_mode"] = new_mode
+                    self.store.save()
+            elif arg:
+                self.tg.send_html(chat_id, "用法：<code>/mode smart</code> | <code>/mode away</code> | <code>/mode always</code>", thread_id=thread_id)
+                return
+            status_html, kb = self._mode_status_html_and_kb(sid)
+            self.tg.send_html(chat_id, status_html, thread_id=thread_id, reply_markup=kb)
             return
 
         if cmd == "/unbind":
@@ -1234,6 +1426,7 @@ class Bridge:
                 created = self.rex.create_session(name, launch_cmd)
                 new_sid = created.get("session_id")
                 if new_sid:
+                    self.mark_tg_activity(new_sid)
                     self.ensure_topic_for_session(new_sid, created.get("label") or name)
                 self.tg.send_html(chat_id, f"✅ 已创建 Session <b>{html.escape(name)}</b> 并开启对应话题。", thread_id=thread_id)
             except Exception as exc:
@@ -1247,6 +1440,24 @@ class Bridge:
                     "ℹ️ 该命令需要在对应的 Session 话题内使用。发 /sync 同步话题，或发 /help 查看说明。",
                     thread_id=thread_id,
                 )
+            return
+
+        if cmd in ("/mute", "/watch", "/unmute"):
+            ov = None if cmd == "/unmute" else cmd.lstrip("/")
+            with self.store.lock:
+                entry = self.store.data.get("sessions", {}).get(sid)
+                if entry is not None:
+                    if ov is None:
+                        entry.pop("notify_override", None)
+                    else:
+                        entry["notify_override"] = ov
+                    self.store.save()
+            reply_msg = {
+                "mute": "🔇 已静音当前话题（仅手动 /screen 仍可用；发 /unmute 恢复）",
+                "watch": "👁 已强制关注当前话题（即使 Rex App 在线也照常推送；发 /unmute 恢复）",
+                None: "🔔 当前话题已恢复跟随全局推送模式（/mode 查看当前模式）",
+            }[ov]
+            self.tg.send_html(chat_id, reply_msg, thread_id=tid)
             return
 
         if cmd == "/panes":
@@ -1309,6 +1520,7 @@ class Bridge:
                 self.tg.send_html(chat_id, "⚠️ 未找到可用的终端 block。", thread_id=tid)
                 return
             try:
+                self.mark_tg_activity(sid)
                 self.rex.send_keys(sid, bid, arg.split())
                 self.tg.react(chat_id, msg["message_id"], "⚡")
             except Exception as exc:
@@ -1324,6 +1536,7 @@ class Bridge:
                 self.tg.send_html(chat_id, "⚠️ 未找到可用的终端 block。", thread_id=tid)
                 return
             try:
+                self.mark_tg_activity(sid)
                 self.rex.send_text(sid, bid, arg, press_enter=False)
                 self.tg.react(chat_id, msg["message_id"], "⚡")
             except Exception as exc:
@@ -1359,6 +1572,7 @@ class Bridge:
             self.tg.send_html(chat_id, "⚠️ 当前 Session 没有活跃终端 block（可能已关闭）。", thread_id=tid)
             return
         try:
+            self.mark_tg_activity(sid)
             self.store.last_sent_text[bid] = text
             # Snapshot before sending so diff only captures new output
             try:
@@ -1391,6 +1605,33 @@ class Bridge:
             return
 
         sid, tid = self._resolve_topic_session(msg)
+
+        # Global mode callbacks work in General or any Topic
+        if data.startswith("mode:"):
+            action = data.split(":", 1)[1]
+            with self.store.lock:
+                if action in ("smart", "away", "always"):
+                    self.store.data["notify_mode"] = action
+                elif action == "urgent":
+                    self.store.data["always_push_urgent"] = not self.get_always_push_urgent()
+                self.store.save()
+            try:
+                self.tg.call("answerCallbackQuery", {"callback_query_id": cb_id, "text": "已更新推送策略"})
+                status_html, kb = self._mode_status_html_and_kb(sid)
+                self.tg.call(
+                    "editMessageText",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "text": status_html,
+                        "parse_mode": "HTML",
+                        "reply_markup": kb,
+                    },
+                )
+            except Exception as exc:
+                log.warning("mode callback error: %s", exc)
+            return
+
         if not sid:
             with self.store.lock:
                 route = self.store.data.get("msg_routes", {}).get(str(msg_id))
@@ -1447,6 +1688,7 @@ class Bridge:
                 return
 
             if data.startswith("k:"):
+                self.mark_tg_activity(sid)
                 key = data.split(":", 1)[1]
                 if key in ("y", "n", "1", "2", "3", "4"):
                     self.store.last_sent_text[bid] = key
@@ -1472,6 +1714,10 @@ class Bridge:
                 "setMyCommands",
                 {
                     "commands": [
+                        {"command": "mode", "description": "查看/切换防打扰模式 (smart/away/always)"},
+                        {"command": "mute", "description": "静音当前话题"},
+                        {"command": "watch", "description": "强制关注当前话题"},
+                        {"command": "unmute", "description": "恢复当前话题跟随全局模式"},
                         {"command": "sync", "description": "同步全部 Rex Sessions 为 Topics"},
                         {"command": "sessions", "description": "列出在线 Rex Sessions"},
                         {"command": "new", "description": "新建 Rex Session (例: /new task agy)"},

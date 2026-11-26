@@ -85,6 +85,8 @@ class BridgeConcurrencyAndLifecycleTests(unittest.TestCase):
             def __init__(self):
                 self.killed = []
                 self.renamed = []
+                self.app_clients = []
+                self.cache_invalidations = 0
 
             def resolve_default_block(self, sid, preferred_block_id=None):
                 return "block:abc123"
@@ -97,6 +99,15 @@ class BridgeConcurrencyAndLifecycleTests(unittest.TestCase):
 
             def rename_session(self, sid, label):
                 self.renamed.append((sid, label))
+
+            def list_connected_app_clients(self):
+                return list(self.app_clients)
+
+            def invalidate_client_cache(self):
+                self.cache_invalidations += 1
+
+            def capture(self, sid, bid, tail_lines=None):
+                return ""
 
         st = bridge.StateStore(Path(tmpdir) / "state.json")
         st.data["chat_id"] = -100123456
@@ -153,6 +164,42 @@ class BridgeConcurrencyAndLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(rex.renamed, [("session:s1", "new-name")])
             self.assertEqual(st.data["sessions"]["session:s1"]["label"], "new-name")
+
+    def test_smart_mode_suppresses_when_app_connected_unless_tg_active_or_urgent(self):
+        with tempfile.TemporaryDirectory() as td:
+            b, rex, st, _calls = self._make_mock_bridge(td)
+            b.ensure_topic_for_session("session:s1", "demo")
+
+            # App away -> push allowed
+            rex.app_clients = []
+            self.assertEqual(b.should_push_outbound("session:s1", "done")[0], True)
+
+            # App connected, no TG interaction -> normal reply suppressed, urgent allowed
+            rex.app_clients = [{"client_id": "c1", "info": {"kind": "app", "label": "MacBook"}}]
+            ok_done, reason_done = b.should_push_outbound("session:s1", "done")
+            self.assertFalse(ok_done)
+            self.assertEqual(reason_done, "app_connected_idle_in_tg")
+            self.assertEqual(b.should_push_outbound("session:s1", "blocked"), (True, "urgent"))
+            self.assertEqual(b.should_push_outbound("session:s1", "question"), (True, "urgent"))
+            self.assertEqual(b.should_push_outbound("session:s1", "error"), (True, "urgent"))
+
+            # User interacts from TG -> normal reply allowed in smart mode
+            b.mark_tg_activity("session:s1")
+            self.assertEqual(b.should_push_outbound("session:s1", "done"), (True, "tg_active"))
+
+            # Switching to away mode suppresses even TG-active normal replies while app connected
+            st.data["notify_mode"] = "away"
+            self.assertEqual(b.should_push_outbound("session:s1", "done"), (False, "app_connected_away"))
+
+            # Per-topic /watch forces push; /mute suppresses even urgent
+            st.data["sessions"]["session:s1"]["notify_override"] = "watch"
+            self.assertEqual(b.should_push_outbound("session:s1", "done"), (True, "topic_watched"))
+            st.data["sessions"]["session:s1"]["notify_override"] = "mute"
+            self.assertEqual(b.should_push_outbound("session:s1", "blocked"), (False, "topic_muted"))
+
+            # Client join/leave event invalidates app client cache
+            b.handle_rex_event({"type": "client_left", "payload": {"client_id": "c1"}})
+            self.assertEqual(rex.cache_invalidations, 1)
 
 
 class AgyHookTests(unittest.TestCase):
