@@ -22,9 +22,9 @@ Run it directly on your Linux server alongside `rex.service` (`systemd --user` +
     - **Any script / agent (`pi`, `opencode`, etc.)**: `rex-tg-notify "message"`.
   - **Rex Native Event Fallback (`rex events --all --json`)**: listens to OSC 7501 `program_status_changed` (`done` / `blocked` / `error`), `desktop_notification`, `bell`, and `child_exited` with automatic TUI chrome scrubbing and hook-race deduplication.
 - **Presence-Aware Anti-Spam (`smart` / `away` / `always`)**
-  - Detects when a Rex GUI client (`kind == "app"`, macOS / iOS) is connected via `client.list`.
-  - In `smart` mode (default): suppresses normal pushes while you are actively working in Rex App, while still delivering replies to Topics you recently messaged from Telegram — and keeps urgent `blocked` / `question` / `error` prompts enabled.
-  - Per-topic `/mute`, `/watch`, and `/unmute` overrides.
+  - Detects when a Rex GUI client (`kind == "app"`, macOS / iOS) is connected and attached to each session via `client.list`.
+  - In `smart` mode (default): suppresses normal pushes only for sessions actively attached in Rex App while idle in Telegram; guarantees delivery of replies to any Telegram-initiated turn regardless of runtime, refreshes activity on `/screen` / screen refresh / `/panes`, and keeps urgent `blocked` / `question` / `error` prompts enabled.
+  - Per-topic `/mute`, `/watch`, and `/unmute` overrides (also toggleable directly inside `/mode`).
 - **Zero External Dependencies**: Pure Node.js CLI + Python 3 stdlib daemon. Supports HTTP/HTTPS proxies (`TG_PROXY`) and custom Telegram Bot API reverse proxies (`TG_API_BASE`, e.g. Cloudflare Workers).
 
 ## Architecture

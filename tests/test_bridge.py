@@ -67,11 +67,16 @@ class BridgeConcurrencyAndLifecycleTests(unittest.TestCase):
         calls = []
 
         class MockTG:
+            def __init__(self):
+                self._next_tid = 42
+
             def call(self, method, payload=None, timeout=40):
                 if method == "createForumTopic":
                     time.sleep(0.15)
+                    tid = self._next_tid
+                    self._next_tid += 1
                     calls.append((method, payload))
-                    return {"message_thread_id": 42}
+                    return {"message_thread_id": tid}
                 calls.append((method, payload))
                 return {}
 
@@ -200,6 +205,106 @@ class BridgeConcurrencyAndLifecycleTests(unittest.TestCase):
             # Client join/leave event invalidates app client cache
             b.handle_rex_event({"type": "client_left", "payload": {"client_id": "c1"}})
             self.assertEqual(rex.cache_invalidations, 1)
+
+    def test_smart_mode_pending_reply_survives_window_expiry_and_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            b, rex, st, _calls = self._make_mock_bridge(td)
+            b.ensure_topic_for_session("session:s1", "demo")
+            rex.app_clients = [
+                {
+                    "client_id": "c1",
+                    "info": {"kind": "app", "label": "MacBook"},
+                    "session_ids": ["session:s1"],
+                }
+            ]
+
+            # User sends a prompt from TG, then agent takes > TG_ACTIVE_WINDOW_SEC (e.g. 20 min)
+            b.mark_tg_activity("session:s1", expect_reply=True)
+            stale_ts = time.time() - (bridge.TG_ACTIVE_WINDOW_SEC + 300)
+            st.last_tg_input_ts["session:s1"] = stale_ts
+            st.pending_tg_reply["session:s1"] = stale_ts
+            st.data["sessions"]["session:s1"]["last_tg_ts"] = stale_ts
+            st.data["sessions"]["session:s1"]["pending_tg_reply_ts"] = stale_ts
+            st.save()
+
+            # Reload StateStore to verify persistence across restarts
+            st2 = bridge.StateStore(Path(td) / "state.json")
+            b2 = bridge.Bridge(b.tg, rex, st2)
+            self.assertEqual(b2.should_push_outbound("session:s1", "done"), (True, "tg_pending_reply"))
+
+            # Delivering the completion clears pending_tg_reply and refreshes active window
+            b2.push_to_topic(
+                "session:s1",
+                "block:abc123",
+                "🤖 <b>agy</b>",
+                "all done",
+                consume_pending_ts=time.time(),
+            )
+            self.assertNotIn("session:s1", st2.pending_tg_reply)
+            self.assertNotIn("pending_tg_reply_ts", st2.data["sessions"]["session:s1"])
+            self.assertEqual(b2.should_push_outbound("session:s1", "done"), (True, "tg_active"))
+
+            # Once active window expires again without new TG interaction, normal push is suppressed
+            st2.last_tg_input_ts["session:s1"] = time.time() - (bridge.TG_ACTIVE_WINDOW_SEC + 10)
+            self.assertEqual(b2.should_push_outbound("session:s1", "done"), (False, "app_connected_idle_in_tg"))
+
+    def test_smart_mode_session_scoped_app_and_screen_refresh_activity(self):
+        with tempfile.TemporaryDirectory() as td:
+            b, rex, st, calls = self._make_mock_bridge(td)
+            b.ensure_topic_for_session("session:s1", "one")
+            b.ensure_topic_for_session("session:s2", "two")
+
+            # Rex App is only attached to session:s1, NOT session:s2
+            rex.app_clients = [
+                {
+                    "client_id": "c1",
+                    "info": {"kind": "app", "label": "MacBook"},
+                    "session_ids": ["session:s1"],
+                }
+            ]
+            self.assertEqual(b.should_push_outbound("session:s1", "done"), (False, "app_connected_idle_in_tg"))
+            self.assertEqual(b.should_push_outbound("session:s2", "done"), (True, "app_not_in_session"))
+
+            # In away mode, any connected App still suppresses globally
+            st.data["notify_mode"] = "away"
+            self.assertEqual(b.should_push_outbound("session:s2", "done"), (False, "app_connected_away"))
+            st.data["notify_mode"] = "smart"
+
+            # Clicking refresh screen ('scr') marks the topic active in TG
+            b.handle_callback(
+                {
+                    "id": "cb1",
+                    "from": {"id": 999},
+                    "data": "scr",
+                    "message": {
+                        "chat": {"id": -100123456},
+                        "message_id": 100,
+                        "is_topic_message": True,
+                        "message_thread_id": 42,
+                    },
+                }
+            )
+            self.assertEqual(b.should_push_outbound("session:s1", "done"), (True, "tg_active"))
+
+            # /mode status panel shows live decision & topic override callback works
+            status_html, kb = b._mode_status_html_and_kb("session:s1")
+            self.assertIn("TG 活跃中", status_html)
+            self.assertEqual(len(kb["inline_keyboard"]), 3)
+            b.handle_callback(
+                {
+                    "id": "cb2",
+                    "from": {"id": 999},
+                    "data": "topic:watch",
+                    "message": {
+                        "chat": {"id": -100123456},
+                        "message_id": 101,
+                        "is_topic_message": True,
+                        "message_thread_id": 42,
+                    },
+                }
+            )
+            self.assertEqual(st.data["sessions"]["session:s1"].get("notify_override"), "watch")
+            self.assertTrue(any(c[0] == "editMessageText" for c in calls))
 
 
 class AgyHookTests(unittest.TestCase):

@@ -46,7 +46,7 @@ BELL_COOLDOWN_SEC = float(os.environ.get("BELL_COOLDOWN_SEC", "15"))
 NOTIFY_MODE = os.environ.get("NOTIFY_MODE", "smart").strip().lower()
 if NOTIFY_MODE not in ("smart", "away", "always"):
     NOTIFY_MODE = "smart"
-TG_ACTIVE_WINDOW_SEC = float(os.environ.get("TG_ACTIVE_WINDOW_SEC", "900"))
+TG_ACTIVE_WINDOW_SEC = float(os.environ.get("TG_ACTIVE_WINDOW_SEC", "1800"))
 ALWAYS_PUSH_URGENT = os.environ.get("ALWAYS_PUSH_URGENT", "1").strip().lower() not in ("0", "false", "no", "off")
 CLIENT_CACHE_TTL_SEC = float(os.environ.get("CLIENT_CACHE_TTL_SEC", "3.0"))
 
@@ -278,6 +278,7 @@ class StateStore:
         self.last_bell_ts: dict[str, float] = {}
         self.last_sent_text: dict[str, str] = {}
         self.last_tg_input_ts: dict[str, float] = {}
+        self.pending_tg_reply: dict[str, float] = {}
         self.load()
 
     def load(self) -> None:
@@ -288,6 +289,17 @@ class StateStore:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     self.data.update(loaded)
+                    for sid, entry in (self.data.get("sessions") or {}).items():
+                        if not isinstance(entry, dict):
+                            continue
+                        ts = entry.get("last_tg_ts")
+                        if isinstance(ts, (int, float)) and ts > 0:
+                            self.last_tg_input_ts[sid] = float(ts)
+                        pending_ts = entry.get("pending_tg_reply_ts")
+                        if isinstance(pending_ts, (int, float)) and pending_ts > 0:
+                            self.pending_tg_reply[sid] = float(pending_ts)
+                        elif entry.get("pending_tg_reply") is True:
+                            self.pending_tg_reply[sid] = float(ts) if isinstance(ts, (int, float)) and ts > 0 else time.time()
             except Exception as exc:
                 log.warning("Failed to load state %s: %s", self.path, exc)
 
@@ -630,12 +642,17 @@ class Bridge:
                 pass
 
             with self.store.lock:
-                self.store.data.setdefault("sessions", {})[session_id] = {
+                new_entry: dict[str, Any] = {
                     "topic_id": tid,
                     "label": label,
                     "active_block_id": default_bid,
                     "closed": False,
                 }
+                if session_id in self.store.last_tg_input_ts:
+                    new_entry["last_tg_ts"] = self.store.last_tg_input_ts[session_id]
+                if session_id in self.store.pending_tg_reply:
+                    new_entry["pending_tg_reply_ts"] = self.store.pending_tg_reply[session_id]
+                self.store.data.setdefault("sessions", {})[session_id] = new_entry
                 self.store.data.setdefault("topics", {})[str(tid)] = session_id
                 self.store.save()
 
@@ -682,6 +699,8 @@ class Bridge:
                 routes = self.store.data.get("msg_routes", {})
                 for mid in [k for k, v in routes.items() if v.get("session_id") == session_id]:
                     routes.pop(mid, None)
+                self.store.last_tg_input_ts.pop(session_id, None)
+                self.store.pending_tg_reply.pop(session_id, None)
                 if not entry and not tids:
                     return False
                 self.store.save()
@@ -782,15 +801,51 @@ class Bridge:
                 return val
         return ALWAYS_PUSH_URGENT
 
-    def mark_tg_activity(self, session_id: str) -> None:
+    def mark_tg_activity(self, session_id: str, expect_reply: bool = False) -> None:
+        now = time.time()
         with self.store.lock:
-            self.store.last_tg_input_ts[session_id] = time.time()
+            self.store.last_tg_input_ts[session_id] = now
+            if expect_reply:
+                self.store.pending_tg_reply[session_id] = now
+            entry = self.store.data.get("sessions", {}).get(session_id)
+            if isinstance(entry, dict):
+                entry["last_tg_ts"] = now
+                if expect_reply:
+                    entry["pending_tg_reply_ts"] = now
+                self.store.save()
+
+    def clear_pending_tg_reply(self, session_id: str, up_to_ts: float) -> None:
+        now = time.time()
+        with self.store.lock:
+            pending_ts = self.store.pending_tg_reply.get(session_id)
+            changed = False
+            if pending_ts is not None and pending_ts <= up_to_ts:
+                self.store.pending_tg_reply.pop(session_id, None)
+                # Keep the topic active for a fresh window after delivering the pending reply
+                self.store.last_tg_input_ts[session_id] = max(self.store.last_tg_input_ts.get(session_id, 0.0), now)
+                changed = True
+            entry = self.store.data.get("sessions", {}).get(session_id)
+            if changed and isinstance(entry, dict):
+                entry.pop("pending_tg_reply_ts", None)
+                entry.pop("pending_tg_reply", None)
+                entry["last_tg_ts"] = self.store.last_tg_input_ts[session_id]
+                self.store.save()
+
+    @staticmethod
+    def _app_clients_for_session(session_id: str, app_clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        matched: list[dict[str, Any]] = []
+        for client in app_clients:
+            sids = client.get("session_ids")
+            if sids is None or session_id in sids:
+                matched.append(client)
+        return matched
 
     def should_push_outbound(self, session_id: str, status: str = "done") -> tuple[bool, str]:
         with self.store.lock:
             entry = self.store.data.get("sessions", {}).get(session_id) or {}
             override = entry.get("notify_override")
             last_tg_ts = self.store.last_tg_input_ts.get(session_id, 0.0)
+            pending_ts = self.store.pending_tg_reply.get(session_id)
 
         if override == "mute":
             return False, "topic_muted"
@@ -811,7 +866,14 @@ class Bridge:
         if mode == "away":
             return False, "app_connected_away"
 
-        # mode == "smart": push only if this topic was recently interacted with from Telegram
+        session_apps = self._app_clients_for_session(session_id, app_clients)
+        if not session_apps:
+            return True, "app_not_in_session"
+
+        # mode == "smart": always deliver pending reply for a TG-initiated turn regardless of runtime
+        if pending_ts is not None:
+            return True, "tg_pending_reply"
+
         if time.time() - last_tg_ts <= TG_ACTIVE_WINDOW_SEC:
             return True, "tg_active"
         return False, "app_connected_idle_in_tg"
@@ -843,8 +905,9 @@ class Bridge:
         else:
             app_line = "⚪ 离线（将自动推送全部话题）"
 
+        win_min = max(1, int(round(TG_ACTIVE_WINDOW_SEC / 60)))
         mode_desc = {
-            "smart": "🧠 <b>smart</b>（Rex App 在线时，仅推近期在 TG 发过消息的话题）",
+            "smart": f"🧠 <b>smart</b>（Rex App 打开当前会话时，仅推待回推/近 {win_min} 分钟在 TG 交互过的话题）",
             "away": "🌙 <b>away</b>（Rex App 在线时全部静音，断开后恢复）",
             "always": "📢 <b>always</b>（始终全部推送）",
         }[mode]
@@ -855,30 +918,49 @@ class Bridge:
             f"• 紧急提醒（审批/提问/报错）：<b>{'开启' if urgent else '关闭'}</b>",
             f"• Rex GUI 客户端：{app_line}",
         ]
+        ov = None
         if sid:
             with self.store.lock:
                 ov = (self.store.data.get("sessions", {}).get(sid) or {}).get("notify_override")
-            ov_label = {"mute": "🔇 已静音 (/unmute 恢复)", "watch": "👁 强制关注 (/unmute 恢复)"}.get(
-                ov, "跟随全局模式（可用 /mute 或 /watch 单独覆盖）"
-            )
-            lines.append(f"• 当前话题：{ov_label}")
+                last_tg_ts = self.store.last_tg_input_ts.get(sid, 0.0)
+            ov_label = {"mute": "🔇 已静音", "watch": "👁 强制关注"}.get(ov, "跟随全局模式")
+            will_push, reason = self.should_push_outbound(sid, status="done")
+            rem_min = max(1, int((TG_ACTIVE_WINDOW_SEC - (time.time() - last_tg_ts) + 59) // 60))
+            reason_label = {
+                "tg_pending_reply": "🟢 将推送（有 TG 发出待回复任务，不限时长）",
+                "tg_active": f"🟢 将推送（TG 活跃中，剩余约 {rem_min} 分钟）",
+                "app_not_in_session": "🟢 将推送（Rex App 未打开本会话）",
+                "app_away": "🟢 将推送（Rex App 离线）",
+                "mode_always": "🟢 将推送（always 模式）",
+                "topic_watched": "🟢 将推送（本话题已强制关注）",
+                "topic_muted": "🔇 不推送（本话题已静音）",
+                "app_connected_away": "⏸ 静默（away 模式且 Rex App 在线）",
+                "app_connected_idle_in_tg": "⏸ 静默（Rex App 已打开本会话且 TG 空闲）",
+            }.get(reason, "🟢 将推送" if will_push else "⏸ 静默")
+            lines.append(f"• 当前话题：{ov_label} · {reason_label}")
 
-        kb = {
-            "inline_keyboard": [
+        kb_rows: list[list[dict[str, str]]] = [
+            [
+                {"text": f"{'✅ ' if mode == 'smart' else ''}🧠 smart", "callback_data": "mode:smart"},
+                {"text": f"{'✅ ' if mode == 'away' else ''}🌙 away", "callback_data": "mode:away"},
+                {"text": f"{'✅ ' if mode == 'always' else ''}📢 always", "callback_data": "mode:always"},
+            ],
+            [
+                {
+                    "text": f"🔔 紧急提醒：{'开' if urgent else '关'}（点击切换）",
+                    "callback_data": "mode:urgent",
+                }
+            ],
+        ]
+        if sid:
+            kb_rows.append(
                 [
-                    {"text": f"{'✅ ' if mode == 'smart' else ''}🧠 smart", "callback_data": "mode:smart"},
-                    {"text": f"{'✅ ' if mode == 'away' else ''}🌙 away", "callback_data": "mode:away"},
-                    {"text": f"{'✅ ' if mode == 'always' else ''}📢 always", "callback_data": "mode:always"},
-                ],
-                [
-                    {
-                        "text": f"🔔 紧急提醒：{'开' if urgent else '关'}（点击切换）",
-                        "callback_data": "mode:urgent",
-                    }
-                ],
-            ]
-        }
-        return "\n".join(lines), kb
+                    {"text": f"{'✅ ' if ov == 'watch' else ''}👁 关注本话题", "callback_data": "topic:watch"},
+                    {"text": f"{'✅ ' if ov == 'mute' else ''}🔇 静音本话题", "callback_data": "topic:mute"},
+                    {"text": f"{'✅ ' if ov is None else ''}↩️ 跟随全局", "callback_data": "topic:unmute"},
+                ]
+            )
+        return "\n".join(lines), {"inline_keyboard": kb_rows}
 
     # ---- Outbound: Agent / Rex -> Telegram ----
 
@@ -892,6 +974,7 @@ class Bridge:
         as_code: bool = False,
         render_md: bool = True,
         from_hook: bool = False,
+        consume_pending_ts: float | None = None,
     ) -> None:
         if not self.is_bound():
             log.info("Bridge not bound yet; dropping push for %s", session_id)
@@ -933,6 +1016,9 @@ class Bridge:
                 fallback_plain=chunk,
             )
             self.store.record_route(sent["message_id"], session_id, block_id)
+
+        if consume_pending_ts is not None:
+            self.clear_pending_tg_reply(session_id, consume_pending_ts)
 
         if from_hook and block_id:
             def _snap() -> None:
@@ -992,6 +1078,7 @@ class Bridge:
             self._snapshot_block_async(session_id, block_id)
             return {"ok": True, "suppressed": reason}
 
+        consume_ts = time.time() if status in ("done", "error") else None
         icon = {
             "done": "🤖",
             "blocked": "⏳",
@@ -1004,7 +1091,7 @@ class Bridge:
 
         threading.Thread(
             target=self.push_to_topic,
-            args=(session_id, block_id, header, text, kb_kind, False, True, True),
+            args=(session_id, block_id, header, text, kb_kind, False, True, True, consume_ts),
             daemon=True,
         ).start()
         return {"ok": True}
@@ -1060,12 +1147,23 @@ class Bridge:
         if not body:
             body = f"状态变更为 {state}"
 
+        consume_ts = time.time() if state in ("done", "error") else None
         icon = {"done": "🤖", "blocked": "⏳", "error": "❌"}[state]
         app_disp = "agy" if app.lower() == "antigravity" else app
         sub = f" · {kind}" if kind else (" · 出错" if state == "error" else (" · 等待处理" if state == "blocked" else ""))
         header = f"{icon} <b>{html.escape(app_disp)}</b>{html.escape(sub)}"
         kb = "blocked" if state == "blocked" else "minimal"
-        self.push_to_topic(sid, bid, header, body, kb_kind=kb, as_code=False, render_md=True, from_hook=False)
+        self.push_to_topic(
+            sid,
+            bid,
+            header,
+            body,
+            kb_kind=kb,
+            as_code=False,
+            render_md=True,
+            from_hook=False,
+            consume_pending_ts=consume_ts,
+        )
 
     def handle_rex_event(self, raw: dict[str, Any]) -> None:
         ev_type = raw.get("type")
@@ -1426,7 +1524,7 @@ class Bridge:
                 created = self.rex.create_session(name, launch_cmd)
                 new_sid = created.get("session_id")
                 if new_sid:
-                    self.mark_tg_activity(new_sid)
+                    self.mark_tg_activity(new_sid, expect_reply=bool(launch_cmd))
                     self.ensure_topic_for_session(new_sid, created.get("label") or name)
                 self.tg.send_html(chat_id, f"✅ 已创建 Session <b>{html.escape(name)}</b> 并开启对应话题。", thread_id=thread_id)
             except Exception as exc:
@@ -1461,6 +1559,7 @@ class Bridge:
             return
 
         if cmd == "/panes":
+            self.mark_tg_activity(sid)
             try:
                 _, blks = self.rex.list_session_blocks(sid)
                 cur_bid = self._resolve_target(sid)
@@ -1486,6 +1585,7 @@ class Bridge:
             return
 
         if cmd in ("/screen", "/s", "/rawscreen"):
+            self.mark_tg_activity(sid)
             n = CAPTURE_LINES
             if arg.isdigit():
                 n = max(5, min(200, int(arg)))
@@ -1520,7 +1620,7 @@ class Bridge:
                 self.tg.send_html(chat_id, "⚠️ 未找到可用的终端 block。", thread_id=tid)
                 return
             try:
-                self.mark_tg_activity(sid)
+                self.mark_tg_activity(sid, expect_reply=True)
                 self.rex.send_keys(sid, bid, arg.split())
                 self.tg.react(chat_id, msg["message_id"], "⚡")
             except Exception as exc:
@@ -1572,7 +1672,7 @@ class Bridge:
             self.tg.send_html(chat_id, "⚠️ 当前 Session 没有活跃终端 block（可能已关闭）。", thread_id=tid)
             return
         try:
-            self.mark_tg_activity(sid)
+            self.mark_tg_activity(sid, expect_reply=True)
             self.store.last_sent_text[bid] = text
             # Snapshot before sending so diff only captures new output
             try:
@@ -1632,6 +1732,37 @@ class Bridge:
                 log.warning("mode callback error: %s", exc)
             return
 
+        if data.startswith("topic:"):
+            if not sid:
+                self.tg.call("answerCallbackQuery", {"callback_query_id": cb_id, "text": "未找到对应 Session"})
+                return
+            action = data.split(":", 1)[1]
+            ov = None if action == "unmute" else (action if action in ("watch", "mute") else None)
+            with self.store.lock:
+                entry = self.store.data.get("sessions", {}).get(sid)
+                if entry is not None:
+                    if ov is None:
+                        entry.pop("notify_override", None)
+                    else:
+                        entry["notify_override"] = ov
+                    self.store.save()
+            try:
+                self.tg.call("answerCallbackQuery", {"callback_query_id": cb_id, "text": "已更新当前话题策略"})
+                status_html, kb = self._mode_status_html_and_kb(sid)
+                self.tg.call(
+                    "editMessageText",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "text": status_html,
+                        "parse_mode": "HTML",
+                        "reply_markup": kb,
+                    },
+                )
+            except Exception as exc:
+                log.warning("topic callback error: %s", exc)
+            return
+
         if not sid:
             with self.store.lock:
                 route = self.store.data.get("msg_routes", {}).get(str(msg_id))
@@ -1656,6 +1787,7 @@ class Bridge:
                 self.delete_topic_and_cleanup(sid)
                 return
             if data.startswith("use:"):
+                self.mark_tg_activity(sid)
                 suffix = data.split(":", 1)[1]
                 _, blks = self.rex.list_session_blocks(sid)
                 matched = next((b for b in blks if b["block_id"].endswith(suffix)), None)
@@ -1679,6 +1811,7 @@ class Bridge:
                 return
 
             if data == "scr":
+                self.mark_tg_activity(sid)
                 self.tg.call("answerCallbackQuery", {"callback_query_id": cb_id, "text": "正在截屏..."})
                 full_cap = self.rex.capture(sid, bid)
                 self.store.last_captures[bid] = full_cap
@@ -1688,7 +1821,7 @@ class Bridge:
                 return
 
             if data.startswith("k:"):
-                self.mark_tg_activity(sid)
+                self.mark_tg_activity(sid, expect_reply=True)
                 key = data.split(":", 1)[1]
                 if key in ("y", "n", "1", "2", "3", "4"):
                     self.store.last_sent_text[bid] = key
