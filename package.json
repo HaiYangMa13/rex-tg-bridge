@@ -1,6 +1,6 @@
 {
   "name": "rex-tg-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "24/7 Telegram Forum Topics bridge for Rex Server and terminal coding agents (agy, Claude Code, Codex, pi, and generic shells)",
   "type": "module",
   "license": "MIT",
